@@ -26,7 +26,11 @@ classifiers = [
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "bitbang>=0.1.53",
+    # 0.1.56 is the first release accepting product/product_version, which
+    # the adapter passes unconditionally. An older bitbang raises TypeError
+    # on the unknown kwargs and the plugin never starts, so do not lower
+    # this floor without also making those kwargs optional.
+    "bitbang>=0.1.56",
     # aiortc/av come transitively via bitbang. aiortc<1.11 already caps av<14.
     # 32-bit (armv7l) has NO PyAV wheels at any in-range version, so av builds
     # from source against the system FFmpeg (Bookworm 5.1); av<12 lands it on the

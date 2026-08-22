@@ -10,6 +10,7 @@ import logging
 from bitbang import BitBangASGI
 from aiortc.contrib.media import MediaRelay
 
+from . import __plugin_version__
 from .camera import detect_camera
 
 _log = logging.getLogger(__name__)
@@ -35,6 +36,18 @@ class OctoPrintBitBang(BitBangASGI):
     """
 
     def __init__(self, app, camera_source=None, ws_target=None, logger=None, **kwargs):
+        # Name ourselves to the update check. The signaling server states
+        # the latest release of every BitBang project; without this we
+        # would read the bitbang library's row and tell a plugin user to
+        # upgrade a package they did not install. Nothing is sent either
+        # way -- the table is the same for everyone and we pick our row
+        # from it locally.
+        kwargs.setdefault("product", "octoprint")
+        kwargs.setdefault("product_version", __plugin_version__)
+        kwargs.setdefault(
+            "install_hint",
+            "update it from OctoPrint's Plugin Manager",
+        )
         super().__init__(app, **kwargs)
         self.ws_target = ws_target  # host:port for WebSocket bridging
         self.relay = MediaRelay()
