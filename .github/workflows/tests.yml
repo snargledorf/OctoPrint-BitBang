@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Installed rather than run from the source tree: __plugin_version__
+      # reads package metadata, so a bare checkout would report
+      # 0.0.0+unknown and the version assertions would pass vacuously.
+      # This also resolves the bitbang floor from pyproject for real.
+      - name: Install the plugin and its dependencies
+        run: |
+          pip install --upgrade pip
+          pip install . pytest
+
+      - name: Smoke test
+        run: pytest tests/ -v
