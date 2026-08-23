@@ -13,23 +13,47 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
+
+      # main, not vars.BITBANG_CLI_REF. That pin exists so a release
+      # bundles a known-good CLI; a test wants to know whether the plugin
+      # still works against the CLI as it is now. Pinning here would hide
+      # exactly the drift this job is for.
+      - name: Checkout bitbang-cli (main)
+        uses: actions/checkout@v4
+        with:
+          repository: richlegrand/bitbang-cli
+          ref: main
+          path: _bitbang-cli
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: _bitbang-cli/go.mod
+
+      # amd64 only. The release build cross-compiles arm64 and armv7 too,
+      # but those cannot run on this runner, and what is being tested is
+      # the argv contract rather than the cross-compile.
+      - name: Build the proxy this plugin drives
+        run: |
+          cd _bitbang-cli
+          CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/bitbang" ./cmd/bitbang
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # Installed rather than run from the source tree: __plugin_version__
-      # reads package metadata, so a bare checkout would report
-      # 0.0.0+unknown and the version assertions would pass vacuously.
-      # This also resolves the bitbang floor from pyproject for real.
+      # Installed rather than run from the checkout: __plugin_version__
+      # reads package metadata, so a bare tree reports 0.0.0+unknown and
+      # the version assertions would pass vacuously.
       - name: Install the plugin and its dependencies
         run: |
           pip install --upgrade pip
           pip install . pytest
 
       - name: Smoke test
+        env:
+          BITBANG_BIN: ${{ github.workspace }}/bitbang
         run: pytest tests/ -v
