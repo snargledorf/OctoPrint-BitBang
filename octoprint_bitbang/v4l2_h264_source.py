@@ -427,6 +427,7 @@ class V4l2H264Track(MediaStreamTrack):
             # dump_extra re-inserts SPS/PPS before every keyframe.
             bsf += ",dump_extra=freq=keyframe"
         cmd += ["-bsf:v", bsf, "-flush_packets", "1", "-f", "h264", "pipe:1"]
+        self._logger.debug(f"BitBang: ffmpeg cmd: {cmd}")
         return cmd
 
     def _drain_stderr(self, pipe):
