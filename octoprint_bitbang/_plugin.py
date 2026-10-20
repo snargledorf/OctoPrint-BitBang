@@ -17,7 +17,7 @@ import threading
 
 import flask
 import octoprint.plugin
-from octoprint.schema.webcam import Webcam, WebcamCompatibility
+from octoprint.schema.webcam import RatioEnum, Webcam, WebcamCompatibility
 
 from . import __plugin_name__, __plugin_version__
 from .camera import detect_camera
@@ -386,7 +386,7 @@ class BitBangPlugin(
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    # -- Local WebRTC video signaling --
+    # -- Local WebRTC video signaling & camera endpoints --
 
     @octoprint.plugin.BlueprintPlugin.route("/ice-servers", methods=["GET"])
     def get_ice_servers(self):
@@ -394,14 +394,76 @@ class BitBangPlugin(
         servers = self._adapter.get_ice_servers() if self._adapter else []
         return flask.jsonify(servers)
 
-    @octoprint.plugin.BlueprintPlugin.route("/offer", methods=["POST"])
+    @octoprint.plugin.BlueprintPlugin.route("/offer", methods=["POST", "OPTIONS"])
+    @octoprint.plugin.BlueprintPlugin.csrf_exempt()
     def local_offer(self):
-        """Exchange WebRTC SDP for local H.264 video streaming."""
+        """Exchange WebRTC SDP for local H.264 video streaming (JSON or WHEP)."""
+        if flask.request.method == "OPTIONS":
+            return flask.Response(
+                "",
+                status=204,
+                headers={
+                    "Accept-Post": "application/sdp, application/json",
+                    "Allow": "POST, OPTIONS",
+                },
+            )
+        return self._negotiate_webrtc()
+
+    @octoprint.plugin.BlueprintPlugin.route(
+        "/webrtc", methods=["GET", "POST", "OPTIONS", "DELETE"]
+    )
+    @octoprint.plugin.BlueprintPlugin.csrf_exempt()
+    def webrtc_stream(self):
+        """WebRTC / WHEP stream endpoint exposed in OctoPrint webcam settings.
+
+        - POST (application/sdp or application/json): WHEP / WebRTC SDP offer-answer
+        - GET ?action=snapshot: returns JPEG snapshot (for clients like Home Assistant /
+          pyoctoprintapi that derive the snapshot URL by appending ?action=snapshot
+          to streamUrl)
+        - GET: renders templates/bitbang_stream.jinja2 (standalone HTML5 <video> player)
+        - OPTIONS / DELETE: WHEP resource lifecycle responses
+        """
+        if flask.request.method == "OPTIONS":
+            return flask.Response(
+                "",
+                status=204,
+                headers={
+                    "Accept-Post": "application/sdp, application/json",
+                    "Allow": "GET, POST, OPTIONS, DELETE",
+                },
+            )
+        if flask.request.method == "DELETE":
+            return flask.Response("", status=200)
+        if flask.request.method == "GET":
+            if flask.request.args.get("action") == "snapshot":
+                return self.webcam_snapshot()
+            return flask.render_template("bitbang_stream.jinja2")
+        return self._negotiate_webrtc()
+
+    def _negotiate_webrtc(self):
+        """Handle a WebRTC SDP offer via either JSON ({sdp, type}) or WHEP
+        (Content-Type: application/sdp raw body)."""
         if not self._adapter or not self._adapter.player or not self._adapter.player.video:
             return flask.jsonify({"error": "no camera"}), 503
 
-        offer_sdp = flask.request.json.get("sdp")
-        offer_type = flask.request.json.get("type", "offer")
+        content_type = (flask.request.content_type or "").lower()
+        is_whep = content_type.startswith("application/sdp")
+        offer_sdp = None
+        offer_type = "offer"
+
+        if is_whep:
+            offer_sdp = (flask.request.get_data(as_text=True) or "").strip()
+        else:
+            payload = flask.request.get_json(silent=True)
+            if isinstance(payload, dict):
+                offer_sdp = payload.get("sdp")
+                offer_type = payload.get("type", "offer")
+            else:
+                raw = (flask.request.get_data(as_text=True) or "").strip()
+                if raw.startswith("v=0"):
+                    is_whep = True
+                    offer_sdp = raw
+
         if not offer_sdp:
             return flask.jsonify({"error": "missing sdp"}), 400
 
@@ -417,33 +479,93 @@ class BitBangPlugin(
         )
         try:
             answer = future.result(timeout=10)
-            answer['ice_servers'] = ice_servers
+            if is_whep:
+                return flask.Response(
+                    answer["sdp"],
+                    status=201,
+                    mimetype="application/sdp",
+                    headers={
+                        "Location": flask.request.path,
+                        "Access-Control-Expose-Headers": "Location",
+                    },
+                )
+            answer["ice_servers"] = ice_servers
             return flask.jsonify(answer)
         except Exception as e:
             self._logger.error(f"Local WebRTC offer failed: {e}")
             return flask.jsonify({"error": str(e)}), 500
 
+    @octoprint.plugin.BlueprintPlugin.route("/snapshot", methods=["GET"])
+    def webcam_snapshot(self):
+        """Return a single JPEG snapshot from the camera stream."""
+        from octoprint.webcams import WebcamNotAbleToTakeSnapshotException
+
+        try:
+            chunks = self.take_webcam_snapshot("bitbang")
+            jpeg_bytes = b"".join(chunks)
+        except WebcamNotAbleToTakeSnapshotException:
+            return flask.jsonify({"error": "no camera"}), 503
+        except Exception as e:
+            self._logger.error(f"Snapshot endpoint failed: {e}")
+            return flask.jsonify({"error": str(e)}), 500
+
+        return flask.Response(
+            jpeg_bytes,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+
     def _strip_non_h264(self, sdp):
-        """Remove non-H.264 video codecs from an SDP so aiortc has no
-        choice but to negotiate H.264 (our track is pre-encoded H.264)."""
+        """Remove non-H.264 video codecs from the m=video section of an SDP so
+        aiortc has no choice but to negotiate H.264 (our track is pre-encoded
+        H.264). Non-video sections (e.g. m=audio from WHEP/go2rtc clients) are
+        left intact so aiortc can parse and reject them cleanly."""
         import re
-        lines = sdp.split("\r\n")
-        h264_pts = [m.group(1) for m in (re.match(r"a=rtpmap:(\d+) H264/", l) for l in lines) if m]
-        rtx_pts = [m.group(1) for m in (re.match(r"a=fmtp:(\d+) apt=(\d+)", l) for l in lines) if m and m.group(2) in h264_pts]
+        lines = sdp.splitlines()
+        video_lines = []
+        in_video = False
+        for line in lines:
+            if line.startswith("m=video "):
+                in_video = True
+            elif line.startswith("m="):
+                in_video = False
+            if in_video:
+                video_lines.append(line)
+
+        h264_pts = [
+            m.group(1)
+            for m in (re.match(r"a=rtpmap:(\d+) H264/", l, re.IGNORECASE) for l in video_lines)
+            if m
+        ]
+        if not h264_pts:
+            return sdp
+        rtx_pts = [
+            m.group(1)
+            for m in (re.match(r"a=fmtp:(\d+) apt=(\d+)", l) for l in video_lines)
+            if m and m.group(2) in h264_pts
+        ]
         keep = set(h264_pts) | set(rtx_pts)
         out = []
+        in_video = False
         for line in lines:
-            m = re.match(r"(m=video \d+ \S+) (.+)", line)
-            if m:
-                header, pts = m.groups()
-                kept = [p for p in pts.split() if p in keep]
-                out.append(f"{header} {' '.join(kept)}")
-                continue
-            m = re.match(r"a=(rtpmap|fmtp|rtcp-fb):(\d+)", line)
-            if m and m.group(2) not in keep:
-                continue
+            if line.startswith("m=video "):
+                in_video = True
+                m = re.match(r"(m=video \d+ \S+) (.+)", line)
+                if m:
+                    header, pts = m.groups()
+                    kept = [p for p in pts.split() if p in keep]
+                    if kept:
+                        out.append(f"{header} {' '.join(kept)}")
+                        continue
+            elif line.startswith("m="):
+                in_video = False
+
+            if in_video:
+                m = re.match(r"a=(rtpmap|fmtp|rtcp-fb):(\d+)", line)
+                if m and m.group(2) not in keep:
+                    continue
             out.append(line)
-        return "\r\n".join(out)
+        return "\r\n".join(out) + ("\r\n" if sdp.endswith(("\r\n", "\n")) else "")
 
     async def _handle_local_offer(self, offer_sdp, offer_type, ice_servers=None):
         offer_sdp = self._strip_non_h264(offer_sdp)
@@ -478,6 +600,18 @@ class BitBangPlugin(
 
     # -- Camera settings API --
 
+    def _check_permission(self, permission_name):
+        """Return True if the current request has `permission_name` (or if
+        OctoPrint's permission system isn't active in a test context)."""
+        try:
+            from octoprint.access.permissions import Permissions
+            perm = getattr(Permissions, permission_name, None)
+            if perm is not None and not perm.can():
+                return False
+        except ImportError:
+            pass
+        return True
+
     @octoprint.plugin.BlueprintPlugin.route("/camera/config", methods=["GET"])
     def camera_config(self):
         """Return current camera display / tuning config for the client."""
@@ -490,6 +624,8 @@ class BitBangPlugin(
     @octoprint.plugin.BlueprintPlugin.route("/camera/brightness", methods=["POST"])
     def set_brightness(self):
         """Update camera brightness live. Accepts {"value": int -100..100}."""
+        if not self._check_permission("CONTROL"):
+            return flask.jsonify({"error": "forbidden"}), 403
         try:
             value = int(flask.request.json.get("value"))
         except (TypeError, ValueError, AttributeError):
@@ -515,6 +651,8 @@ class BitBangPlugin(
         We list only real cameras: USB/UVC webcams and the legacy mmal Pi
         camera (see _camera_info). Modern-stack CSI cameras come via picamera2.
         """
+        if not self._check_permission("SETTINGS_READ"):
+            return flask.jsonify({"error": "forbidden"}), 403
         import subprocess
         cameras = []
         # Pi CSI camera (modern libcamera stack) surfaces through picamera2.
@@ -593,6 +731,8 @@ class BitBangPlugin(
     @octoprint.plugin.BlueprintPlugin.route("/resolutions", methods=["GET"])
     def list_resolutions(self):
         """List supported resolutions for a camera device."""
+        if not self._check_permission("SETTINGS_READ"):
+            return flask.jsonify({"error": "forbidden"}), 403
         import subprocess
         device = flask.request.args.get("device", "")
         # picamera2: explicit Pi CSI selection or auto-detect when present
@@ -707,13 +847,40 @@ class BitBangPlugin(
 
     # -- WebcamProviderPlugin API --
 
+    def _stream_ratio(self):
+        res = (
+            self._settings.get(["camera_resolution"]) or "640x480"
+            if self._settings
+            else "640x480"
+        )
+        try:
+            w, h = (int(x) for x in str(res).split("x"))
+            if w * 3 == h * 4:
+                return RatioEnum.four_three
+        except (ValueError, TypeError):
+            pass
+        return RatioEnum.sixteen_nine
+
     def get_webcam_configurations(self):
+        stream_url = "/plugin/bitbang/webrtc"
+        snapshot_url = "/plugin/bitbang/snapshot"
+        ratio = self._stream_ratio()
         return [
             Webcam(
                 name="bitbang",
                 displayName="BitBang Camera",
                 canSnapshot=True,
-                snapshotDisplay="BitBang plugin captures snapshot from video stream",
+                snapshotDisplay=snapshot_url,
+                compat=WebcamCompatibility(
+                    stream=stream_url,
+                    snapshot=snapshot_url,
+                    streamRatio=ratio,
+                ),
+                extras={
+                    "stream": stream_url,
+                    "snapshot": snapshot_url,
+                    "streamRatio": ratio,
+                },
             )
         ]
 
@@ -914,6 +1081,13 @@ class BitBangPlugin(
         return {
             "js": ["js/bitbang.js"],
         }
+
+    def is_blueprint_protected(self):
+        # Allow external camera consumers (e.g. Home Assistant, go2rtc WHEP)
+        # to reach /webrtc, /offer, and /snapshot without an interactive browser
+        # login session, matching OctoPi's /webcam/ endpoints. Settings and
+        # control routes enforce permissions explicitly via _check_permission.
+        return False
 
     def is_blueprint_csrf_protected(self):
         return True

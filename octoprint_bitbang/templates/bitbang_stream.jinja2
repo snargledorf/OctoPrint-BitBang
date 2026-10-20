@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>BitBang Camera</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            background: #000;
+        }
+    </style>
+</head>
+<body>
+    <video id="bitbang-webcam" data-bitbang-stream="camera" autoplay playsinline muted></video>
+    <script>
+        (function () {
+            if (window.__bbSessionId) {
+                return;
+            }
+            var video = document.getElementById("bitbang-webcam");
+            fetch("/plugin/bitbang/ice-servers")
+                .then(function (r) { return r.json(); })
+                .catch(function () { return []; })
+                .then(function (iceServers) {
+                    var config = (iceServers && iceServers.length) ? { iceServers: iceServers } : {};
+                    var pc = new RTCPeerConnection(config);
+                    pc.ontrack = function (e) {
+                        if (e.streams && e.streams[0]) {
+                            video.srcObject = e.streams[0];
+                        } else {
+                            if (!video.srcObject) video.srcObject = new MediaStream();
+                            video.srcObject.addTrack(e.track);
+                        }
+                    };
+                    pc.addTransceiver("video", { direction: "recvonly" });
+                    return pc.createOffer()
+                        .then(function (o) { return pc.setLocalDescription(o); })
+                        .then(function () {
+                            return fetch("/plugin/bitbang/offer", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    sdp: pc.localDescription.sdp,
+                                    type: pc.localDescription.type
+                                })
+                            });
+                        })
+                        .then(function (r) { return r.json(); })
+                        .then(function (ans) {
+                            if (ans && ans.sdp) return pc.setRemoteDescription(ans);
+                        });
+                });
+        })();
+    </script>
+</body>
+</html>
