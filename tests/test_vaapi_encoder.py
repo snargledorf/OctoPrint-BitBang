@@ -161,9 +161,13 @@ class TestVaapiEncoder(unittest.TestCase):
         self.assertIn("-vf", cmd)
         idx_vf = cmd.index("-vf")
         self.assertEqual(cmd[idx_vf + 1], "hflip,format=nv12,hwupload")
+        self.assertEqual(cmd[cmd.index("-color_range") + 1], "pc")
+        self.assertEqual(cmd[cmd.index("-colorspace") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_trc") + 1], "bt709")
         self.assertIn("-bsf:v", cmd)
         idx_bsf = cmd.index("-bsf:v")
-        self.assertIn("dump_extra=freq=keyframe", cmd[idx_bsf + 1])
+        self.assertEqual(cmd[idx_bsf + 1], "dump_extra=freq=keyframe")
 
     @patch("shutil.which", return_value="/usr/bin/ffmpeg")
     def test_v4l2_h264_track_cmd_vaapi_hwaccel_decode(self, mock_which):
@@ -201,6 +205,11 @@ class TestVaapiEncoder(unittest.TestCase):
         self.assertIn("-c:v", cmd)
         idx_c = cmd.index("-c:v")
         self.assertEqual(cmd[idx_c + 1], "h264_vaapi")
+        self.assertEqual(cmd[cmd.index("-color_range") + 1], "pc")
+        self.assertEqual(cmd[cmd.index("-colorspace") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_trc") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-bsf:v") + 1], "dump_extra=freq=keyframe")
 
     @patch("shutil.which", return_value="/usr/bin/ffmpeg")
     def test_v4l2_h264_track_cmd_vaapi_hwaccel_decode_with_flip(self, mock_which):
@@ -277,9 +286,13 @@ class TestVaapiEncoder(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-tune") + 1], "zerolatency")
         self.assertEqual(cmd[cmd.index("-profile:v") + 1], "baseline")
         self.assertEqual(cmd[cmd.index("-vf") + 1], "format=yuv420p")
+        self.assertEqual(cmd[cmd.index("-color_range") + 1], "pc")
+        self.assertEqual(cmd[cmd.index("-colorspace") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
+        self.assertEqual(cmd[cmd.index("-color_trc") + 1], "bt709")
         # Re-encoders need the parameter sets re-inserted or a browser that
-        # joins mid-stream renders black.
-        self.assertIn("dump_extra=freq=keyframe", " ".join(cmd))
+        # joins mid-stream renders black; VUI is set via encoder flags.
+        self.assertEqual(cmd[cmd.index("-bsf:v") + 1], "dump_extra=freq=keyframe")
 
     @patch("shutil.which", return_value="/usr/bin/ffmpeg")
     def test_v4l2_h264_track_cmd_without_an_input_format(self, mock_which):
@@ -313,6 +326,10 @@ class TestVaapiEncoder(unittest.TestCase):
         self.assertIn("-vf", cmd)
         idx_vf = cmd.index("-vf")
         self.assertEqual(cmd[idx_vf + 1], "format=yuv420p")
+        self.assertNotIn("-color_range", cmd)
+        bsf = cmd[cmd.index("-bsf:v") + 1]
+        self.assertIn("h264_metadata=", bsf)
+        self.assertIn("dump_extra=freq=keyframe", bsf)
 
     @patch("shutil.which", return_value="/usr/bin/ffmpeg")
     def test_v4l2_h264_track_cmd_copy(self, mock_which):
@@ -327,6 +344,10 @@ class TestVaapiEncoder(unittest.TestCase):
         self.assertIn("-c", cmd)
         idx = cmd.index("-c")
         self.assertEqual(cmd[idx + 1], "copy")
+        self.assertNotIn("-color_range", cmd)
+        bsf = cmd[cmd.index("-bsf:v") + 1]
+        self.assertIn("h264_metadata=", bsf)
+        self.assertNotIn("dump_extra", bsf)
 
 
 class TestOctoPrintAdapterVaapiLadder(unittest.TestCase):

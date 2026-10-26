@@ -44,8 +44,17 @@ _log = logging.getLogger(__name__)
 _TIME_BASE = Fraction(1, 1_000_000)
 
 # Full-range BT.709 -- matches the Pi sensor/encoder pipeline at 720p+.
+# Used via h264_metadata BSF for passthrough/v4l2m2m (whose hardware encoders
+# write no VUI colour signalling), and as encoder flags for vaapi/libx264
+# (where rewriting the SPS via h264_metadata can overflow on VAAPI output).
 _VUI_BSF = ("h264_metadata=video_full_range_flag=1:"
             "matrix_coefficients=1:colour_primaries=1:transfer_characteristics=1")
+_COLOR_FLAGS = [
+    "-color_range", "pc",
+    "-colorspace", "bt709",
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+]
 
 # How long to wait for the device node to reappear before reopening anyway.
 # The rest of the reopen policy -- when a run counts as established, the
@@ -448,6 +457,7 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
         ]
         if self._encoder == "copy":
             cmd += ["-c", "copy"]                      # passthrough, no re-encode
+            bsf = _VUI_BSF
         elif self._encoder == "vaapi":
             if use_hwaccel_decode:
                 vf = ["scale_vaapi=format=nv12"]
@@ -458,7 +468,7 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                 cmd += ["-vf", ",".join(vf),
                         "-c:v", "h264_vaapi",
                         "-b:v", str(self._bitrate), "-g", str(self._gop),
-                        "-bf", "0"]
+                        "-bf", "0"] + _COLOR_FLAGS
             else:
                 # Hardware VAAPI re-encode: upload nv12 frames to the VAAPI surface.
                 vf = [f for f, on in (("hflip", self._flip_h),
@@ -468,7 +478,8 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                 cmd += ["-vf", ",".join(vf),
                         "-c:v", "h264_vaapi",
                         "-b:v", str(self._bitrate), "-g", str(self._gop),
-                        "-bf", "0"]
+                        "-bf", "0"] + _COLOR_FLAGS
+            bsf = "dump_extra=freq=keyframe"
         elif self._encoder == "libx264":
             # Software encode in the ffmpeg child rather than in-process.
             # Speed is not the point -- isolation is. When a V4L2 device
@@ -488,7 +499,8 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                     "-preset", "ultrafast", "-tune", "zerolatency",
                     "-profile:v", "baseline",
                     "-b:v", str(self._bitrate), "-g", str(self._gop),
-                    "-bf", "0"]
+                    "-bf", "0"] + _COLOR_FLAGS
+            bsf = "dump_extra=freq=keyframe"
         else:
             # h264_v4l2m2m requires yuv420p input; MJPEG/YUYV decode to other
             # pixel formats, so always convert (and apply any flip in the same
@@ -499,14 +511,12 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
             cmd += ["-vf", ",".join(vf),
                     "-c:v", "h264_v4l2m2m",            # Pi 4 GPU encoder
                     "-b:v", str(self._bitrate), "-g", str(self._gop)]
-        bsf = _VUI_BSF
-        if self._encoder != "copy":
             # Re-encoders emit SPS/PPS only once at stream start (libav then
             # captures them as extradata and strips them from later packets),
             # so a decoder that joins mid-stream — e.g. a browser opening the
             # WebRTC video track — never sees parameter sets and renders black.
             # dump_extra re-inserts SPS/PPS before every keyframe.
-            bsf += ",dump_extra=freq=keyframe"
+            bsf = f"{_VUI_BSF},dump_extra=freq=keyframe"
         cmd += ["-bsf:v", bsf, "-flush_packets", "1", "-f", "h264", "pipe:1"]
         return cmd
 
