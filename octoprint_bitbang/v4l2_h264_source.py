@@ -45,8 +45,10 @@ _TIME_BASE = Fraction(1, 1_000_000)
 
 # Full-range BT.709 -- matches the Pi sensor/encoder pipeline at 720p+.
 # Used via h264_metadata BSF for passthrough/v4l2m2m (whose hardware encoders
-# write no VUI colour signalling), and as encoder flags for vaapi/libx264
-# (where rewriting the SPS via h264_metadata can overflow on VAAPI output).
+# write no VUI colour signalling), and as input flags for vaapi/libx264
+# (where rewriting the SPS via h264_metadata can overflow on VAAPI output, and
+# placing them on the output side makes ffmpeg insert a software auto_scale
+# filter that collides with VAAPI surfaces).
 _VUI_BSF = ("h264_metadata=video_full_range_flag=1:"
             "matrix_coefficients=1:colour_primaries=1:transfer_characteristics=1")
 _COLOR_FLAGS = [
@@ -451,6 +453,12 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
         # name, which is the software rung's business: let ffmpeg pick.
         if self._input_format:
             cmd += ["-input_format", self._input_format]
+        if self._encoder in ("vaapi", "libx264"):
+            # Declare colour properties on the input so ffmpeg passes them
+            # through to the encoder without negotiating a colour conversion in
+            # the filter graph (output-side colour flags trigger auto_scale,
+            # which cannot convert VAAPI hardware surfaces).
+            cmd += _COLOR_FLAGS
         cmd += [
             "-video_size", self._video_size, "-framerate", str(self._framerate),
             "-i", self.device, "-an",
@@ -468,7 +476,7 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                 cmd += ["-vf", ",".join(vf),
                         "-c:v", "h264_vaapi",
                         "-b:v", str(self._bitrate), "-g", str(self._gop),
-                        "-bf", "0"] + _COLOR_FLAGS
+                        "-bf", "0"]
             else:
                 # Hardware VAAPI re-encode: upload nv12 frames to the VAAPI surface.
                 vf = [f for f, on in (("hflip", self._flip_h),
@@ -478,7 +486,7 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                 cmd += ["-vf", ",".join(vf),
                         "-c:v", "h264_vaapi",
                         "-b:v", str(self._bitrate), "-g", str(self._gop),
-                        "-bf", "0"] + _COLOR_FLAGS
+                        "-bf", "0"]
             bsf = "dump_extra=freq=keyframe"
         elif self._encoder == "libx264":
             # Software encode in the ffmpeg child rather than in-process.
@@ -499,7 +507,7 @@ class V4l2H264Track(CaptureSupervisor, MediaStreamTrack):
                     "-preset", "ultrafast", "-tune", "zerolatency",
                     "-profile:v", "baseline",
                     "-b:v", str(self._bitrate), "-g", str(self._gop),
-                    "-bf", "0"] + _COLOR_FLAGS
+                    "-bf", "0"]
             bsf = "dump_extra=freq=keyframe"
         else:
             # h264_v4l2m2m requires yuv420p input; MJPEG/YUYV decode to other
